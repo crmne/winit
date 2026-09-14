@@ -46,3 +46,4 @@ changelog entry.
   (xdg-shell v6 `suspended` state).
 - On Wayland, add `WindowExtWayland::notify_presentation_paused`, which lets winit commit a
   suspended window's configures while the application isn't presenting.
+- On macOS, add the opt-in `macos-quit-as-close` feature to review native Quit requests through window close handlers and return normally from `run_app_on_demand`.
