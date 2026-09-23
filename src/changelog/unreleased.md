@@ -39,3 +39,9 @@ The migration guide could reference other migration examples in the current
 changelog entry.
 
 ## Unreleased
+
+### Fixed
+
+- On Wayland, emit `WindowEvent::Occluded` when the compositor suspends or resumes the window
+  (xdg-shell v6 `suspended` state), and don't request a redraw while it is suspended, so a
+  renderer using vsync no longer blocks on a hidden window.

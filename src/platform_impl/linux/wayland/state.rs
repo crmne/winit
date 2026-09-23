@@ -283,23 +283,37 @@ impl WindowHandler for WinitState {
         };
 
         // Populate the configure to the window.
-        self.window_compositor_updates[pos].resized |= self
-            .windows
-            .get_mut()
-            .get_mut(&window_id)
-            .expect("got configure for dead window.")
-            .lock()
-            .unwrap()
-            .configure(configure, &self.shm, &self.subcompositor_state);
+        let (resized, was_suspended, suspended) = {
+            let mut window = self
+                .windows
+                .get_mut()
+                .get_mut(&window_id)
+                .expect("got configure for dead window.")
+                .lock()
+                .unwrap();
+            let was_suspended = window.is_suspended();
+            let resized = window.configure(configure, &self.shm, &self.subcompositor_state);
+            (resized, was_suspended, window.is_suspended())
+        };
+        self.window_compositor_updates[pos].resized |= resized;
+        if suspended != was_suspended {
+            self.window_compositor_updates[pos].occluded = Some(suspended);
+        }
 
         // NOTE: configure demands wl_surface::commit, however winit doesn't commit on behalf of the
         // users, since it can break a lot of things, thus it'll ask users to redraw instead.
-        self.window_requests
-            .get_mut()
-            .get(&window_id)
-            .unwrap()
-            .redraw_requested
-            .store(true, Ordering::Relaxed);
+        //
+        // A suspended window receives no frame callbacks, so a redraw presented with vsync would
+        // block until the window is shown again. Its configure is acknowledged by the first commit
+        // after the suspension ends, which xdg-shell allows, and that configure asks for a redraw.
+        if !suspended {
+            self.window_requests
+                .get_mut()
+                .get(&window_id)
+                .unwrap()
+                .redraw_requested
+                .store(true, Ordering::Relaxed);
+        }
 
         // Manually mark that we've got an event, since configure may not generate a resize.
         self.dispatched_events = true;
@@ -418,11 +432,14 @@ pub struct WindowCompositorUpdate {
 
     /// Close the window.
     pub close_window: bool,
+
+    /// The window became suspended (`Some(true)`) or stopped being suspended (`Some(false)`).
+    pub occluded: Option<bool>,
 }
 
 impl WindowCompositorUpdate {
     fn new(window_id: WindowId) -> Self {
-        Self { window_id, resized: false, scale_changed: false, close_window: false }
+        Self { window_id, resized: false, scale_changed: false, close_window: false, occluded: None }
     }
 }
 
