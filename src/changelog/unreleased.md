@@ -43,3 +43,9 @@ changelog entry.
 ### Added
 
 - On macOS, add the opt-in `macos-quit-as-close` feature to review native Quit requests through window close handlers and return normally from `run_app_on_demand`.
+
+### Fixed
+
+- On Wayland, emit `WindowEvent::Occluded` when the compositor suspends or resumes the window
+  (xdg-shell v6 `suspended` state), and don't request a redraw while it is suspended, so a
+  renderer using vsync no longer blocks on a hidden window.
