@@ -274,6 +274,8 @@ impl<T: 'static> EventLoop<T> {
                 };
                 min_timeout(control_flow_timeout, timeout)
             };
+            // Wake for a redraw held back by a frame callback that may never come.
+            timeout = min_timeout(self.throttled_redraw_timeout(), timeout);
 
             // NOTE Ideally we should flush as the last thing we do before polling
             // to wait for events, and this should be done by the calloop
@@ -483,7 +485,9 @@ impl<T: 'static> EventLoop<T> {
                 let mut window =
                     state.windows.get_mut().get_mut(window_id).unwrap().lock().unwrap();
 
-                if window.frame_callback_state() == FrameCallbackState::Requested {
+                if window.frame_callback_state() == FrameCallbackState::Requested
+                    && !window.frame_callback_overdue()
+                {
                     return None;
                 }
 
@@ -494,6 +498,14 @@ impl<T: 'static> EventLoop<T> {
 
                 // Redraw the frame while at it.
                 redraw_requested |= window.refresh_frame();
+
+                // Pace the next redraw by the compositor's frame callback, as
+                // `pre_present_notify` would, so an application presenting
+                // without vsync still draws at most once per displayed frame and
+                // never blocks in its swap while the surface is hidden.
+                if redraw_requested {
+                    window.request_frame_callback();
+                }
 
                 redraw_requested.then_some(WindowEvent::RedrawRequested)
             });
@@ -573,6 +585,25 @@ impl<T: 'static> EventLoop<T> {
         };
 
         callback(state)
+    }
+
+    /// The time until the earliest redraw waiting on a frame callback may go
+    /// ahead without it.
+    fn throttled_redraw_timeout(&mut self) -> Option<Duration> {
+        self.with_state(|state| {
+            let requests = state.window_requests.get_mut();
+            state
+                .windows
+                .get_mut()
+                .iter()
+                .filter(|(window_id, _)| {
+                    requests
+                        .get(window_id)
+                        .is_some_and(|request| request.redraw_requested.load(Ordering::Relaxed))
+                })
+                .filter_map(|(_, window)| window.lock().unwrap().frame_callback_remaining())
+                .min()
+        })
     }
 
     fn loop_dispatch<D: Into<Option<std::time::Duration>>>(&mut self, timeout: D) -> IOResult<()> {

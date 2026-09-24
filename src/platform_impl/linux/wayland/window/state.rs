@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ahash::HashSet;
 use tracing::{info, warn};
@@ -141,6 +141,9 @@ pub struct WindowState {
     /// The state of the frame callback.
     frame_callback_state: FrameCallbackState,
 
+    /// When the frame callback in flight was requested.
+    frame_callback_requested_at: Option<Instant>,
+
     viewport: Option<WpViewport>,
     fractional_scale: Option<WpFractionalScaleV1>,
     blur: Option<OrgKdeKwinBlur>,
@@ -196,6 +199,7 @@ impl WindowState {
             fractional_scale,
             frame: None,
             frame_callback_state: FrameCallbackState::None,
+            frame_callback_requested_at: None,
             seat_focus: Default::default(),
             has_pending_move: None,
             ime_allowed: false,
@@ -255,10 +259,34 @@ impl WindowState {
         match self.frame_callback_state {
             FrameCallbackState::None | FrameCallbackState::Received => {
                 self.frame_callback_state = FrameCallbackState::Requested;
+                self.frame_callback_requested_at = Some(Instant::now());
                 surface.frame(&self.queue_handle, surface.clone());
             },
             FrameCallbackState::Requested => (),
         }
+    }
+
+    /// How long until the frame callback in flight becomes overdue, if one is.
+    pub fn frame_callback_remaining(&self) -> Option<Duration> {
+        (self.frame_callback_state == FrameCallbackState::Requested).then(|| {
+            self.frame_callback_requested_at.map_or(Duration::ZERO, |requested| {
+                FRAME_CALLBACK_TIMEOUT.saturating_sub(requested.elapsed())
+            })
+        })
+    }
+
+    /// Whether the frame callback in flight is late enough to stop waiting for.
+    ///
+    /// A compositor sends no frame callbacks to a surface it is not showing: a
+    /// window on a hidden workspace, behind a lock screen, or on a monitor that
+    /// is off. It may also drop a callback requested while the surface was
+    /// hidden. Throttling redraws on such a callback forever freezes the
+    /// window, so after [`FRAME_CALLBACK_TIMEOUT`] a redraw goes ahead anyway.
+    pub fn frame_callback_overdue(&self) -> bool {
+        self.frame_callback_state == FrameCallbackState::Requested
+            && self
+                .frame_callback_requested_at
+                .is_some_and(|requested| requested.elapsed() >= FRAME_CALLBACK_TIMEOUT)
     }
 
     pub fn configure(
@@ -1181,6 +1209,9 @@ impl GrabState {
         Self { user_grab_mode: CursorGrabMode::None, current_grab_mode: CursorGrabMode::None }
     }
 }
+
+/// How long a redraw waits for a frame callback before drawing without it.
+pub const FRAME_CALLBACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The state of the frame callback.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
