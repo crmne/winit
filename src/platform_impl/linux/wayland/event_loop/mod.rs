@@ -275,7 +275,17 @@ impl<T: 'static> EventLoop<T> {
                 min_timeout(control_flow_timeout, timeout)
             };
             // Wake for a redraw held back by a frame callback that may never come.
-            timeout = min_timeout(self.throttled_redraw_timeout(), timeout);
+            // An application that asked to wake at once only to redraw (eframe
+            // does, while a repaint is pending) would otherwise spin until the
+            // callback arrives; wait for the callback or the deadline instead.
+            // Any other event still wakes the loop.
+            let throttled = self.throttled_redraw_timeout();
+            timeout = match (timeout, throttled) {
+                (Some(wait), Some(throttled)) if wait.is_zero() && self.redraws_all_throttled() => {
+                    Some(throttled)
+                },
+                _ => min_timeout(throttled, timeout),
+            };
 
             // NOTE Ideally we should flush as the last thing we do before polling
             // to wait for events, and this should be done by the calloop
@@ -603,6 +613,24 @@ impl<T: 'static> EventLoop<T> {
                 })
                 .filter_map(|(_, window)| window.lock().unwrap().frame_callback_remaining())
                 .min()
+        })
+    }
+
+    /// Whether every window that wants a redraw is waiting on its frame
+    /// callback, so waking now could only find nothing to do.
+    fn redraws_all_throttled(&mut self) -> bool {
+        self.with_state(|state| {
+            let requests = state.window_requests.get_mut();
+            state.windows.get_mut().iter().all(|(window_id, window)| {
+                let wants_redraw = requests
+                    .get(window_id)
+                    .is_some_and(|request| request.redraw_requested.load(Ordering::Relaxed));
+                !wants_redraw || {
+                    let window = window.lock().unwrap();
+                    window.frame_callback_state() == FrameCallbackState::Requested
+                        && !window.frame_callback_overdue()
+                }
+            })
         })
     }
 
