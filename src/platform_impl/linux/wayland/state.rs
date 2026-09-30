@@ -12,7 +12,6 @@ use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
 use sctk::compositor::{CompositorHandler, CompositorState};
-use sctk::data_device_manager::DataDeviceManagerState;
 use sctk::output::{OutputHandler, OutputState};
 use sctk::registry::{ProvidesRegistryState, RegistryState};
 use sctk::seat::pointer::ThemedPointer;
@@ -54,9 +53,6 @@ pub struct WinitState {
 
     /// The seat state responsible for all sorts of input.
     pub seat_state: SeatState,
-
-    /// The data device manager, which gives each seat a data device for file drags.
-    pub data_device_manager_state: Option<DataDeviceManagerState>,
 
     /// The shm for software buffers, such as cursors.
     pub shm: Shm,
@@ -147,20 +143,9 @@ impl WinitState {
 
         let seat_state = SeatState::new(globals, queue_handle);
 
-        let data_device_manager_state = match DataDeviceManagerState::bind(globals, queue_handle) {
-            Ok(manager) => Some(manager),
-            Err(e) => {
-                tracing::warn!("Data device manager not available, ignoring file drops: {e:?}");
-                None
-            },
-        };
-
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
-            let data_device = data_device_manager_state
-                .as_ref()
-                .map(|manager| manager.get_data_device(queue_handle, &seat));
-            seats.insert(seat.id(), WinitSeatState::new(data_device));
+            seats.insert(seat.id(), WinitSeatState::new());
         }
 
         let (viewporter_state, fractional_scaling_manager) =
@@ -179,7 +164,6 @@ impl WinitState {
             subcompositor_state: subcompositor_state.map(Arc::new),
             output_state,
             seat_state,
-            data_device_manager_state,
             shm,
             custom_cursor_pool,
 

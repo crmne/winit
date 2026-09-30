@@ -12,7 +12,6 @@ use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 use sctk::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 
-use sctk::data_device_manager::data_device::DataDevice;
 use sctk::seat::pointer::{ThemeSpec, ThemedPointer};
 use sctk::seat::{Capability as SeatCapability, SeatHandler, SeatState};
 
@@ -20,7 +19,6 @@ use crate::event::WindowEvent;
 use crate::keyboard::ModifiersState;
 use crate::platform_impl::wayland::state::WinitState;
 
-mod dnd;
 mod keyboard;
 mod pointer;
 mod text_input;
@@ -59,17 +57,11 @@ pub struct WinitSeatState {
 
     /// Whether we have pending modifiers.
     modifiers_pending: bool,
-
-    /// The data device bound on the seat, which receives file drags.
-    data_device: Option<DataDevice>,
-
-    /// The file drag over one of our windows.
-    file_drag: Option<dnd::FileDrag>,
 }
 
 impl WinitSeatState {
-    pub fn new(data_device: Option<DataDevice>) -> Self {
-        Self { data_device, ..Default::default() }
+    pub fn new() -> Self {
+        Default::default()
     }
 }
 
@@ -210,14 +202,10 @@ impl SeatHandler for WinitState {
     fn new_seat(
         &mut self,
         _connection: &Connection,
-        queue_handle: &QueueHandle<Self>,
+        _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        let data_device = self
-            .data_device_manager_state
-            .as_ref()
-            .map(|manager| manager.get_data_device(queue_handle, &seat));
-        self.seats.insert(seat.id(), WinitSeatState::new(data_device));
+        self.seats.insert(seat.id(), WinitSeatState::new());
     }
 
     fn remove_seat(
@@ -226,7 +214,6 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        self.cancel_file_drag(&seat.id());
         let _ = self.seats.remove(&seat.id());
         self.on_keyboard_destroy(&seat.id());
     }
