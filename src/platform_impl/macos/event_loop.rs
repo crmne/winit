@@ -25,6 +25,7 @@ use super::app_state::{ApplicationDelegate, HandlePendingUserEvents};
 use super::event::dummy_event;
 use super::monitor::{self, MonitorHandle};
 use super::observer::setup_control_flow_observers;
+use super::window::WinitWindow;
 use crate::error::EventLoopError;
 use crate::event::Event;
 use crate::event_loop::{
@@ -428,8 +429,13 @@ pub(super) fn stop_app_immediately(app: &NSApplication) {
 /// This ensures that no windows linger on after the event loop has exited,
 /// see <https://github.com/rust-windowing/winit/issues/4135>.
 pub(super) fn notify_windows_of_exit(app: &NSApplication) {
+    // Only close the windows winit made. The application can own others that
+    // must outlive the event loop: a status item's window is one, and closing
+    // it leaves the menu-bar item drawn but deaf to clicks.
     for window in app.windows() {
-        window.close();
+        if window.is_kind_of::<WinitWindow>() {
+            window.close();
+        }
     }
 }
 
