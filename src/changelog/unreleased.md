@@ -52,3 +52,4 @@ changelog entry.
 
 - On Windows, fix runaway window growth when dragging across monitors with
   different DPI scale factors.
+- On Windows 11, prevent incorrect shifting when dragging window onto a monitor with different DPI.
