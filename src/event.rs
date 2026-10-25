@@ -805,6 +805,17 @@ pub enum Ime {
     /// Right before this event winit will send empty [`Self::Preedit`] event.
     Commit(String),
 
+    /// Notifies when text around the cursor should be deleted, usually right before a
+    /// [`Self::Commit`] that replaces it.
+    ///
+    /// The counts are numbers of characters, not bytes.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **macOS:** Sent when the accent picker shown while holding a key replaces the character
+    ///   that key typed.
+    DeleteSurrounding { before_chars: usize, after_chars: usize },
+
     /// Notifies when the IME was disabled.
     ///
     /// After receiving this event you won't get any more [`Preedit`][Self::Preedit] or
