@@ -80,6 +80,19 @@ impl Clipboard {
         self.state()?.load_text()
     }
 
+    /// Reads the offered `mime_type` from the clipboard as unmodified bytes.
+    ///
+    /// This uses the window's existing data device, so it also works in a sandbox that
+    /// does not expose the privileged data-control protocols or the X11 socket. The
+    /// application must have keyboard focus for the compositor to offer its selection.
+    ///
+    /// Returns `InvalidData` when the selection does not offer this type. Like
+    /// [`Self::load_text`], reading another client's selection can wait for up to two
+    /// seconds of silence. Reading text this way does not normalize its line endings.
+    pub fn load_bytes(&self, mime_type: &str) -> io::Result<Vec<u8>> {
+        self.state()?.load_bytes(mime_type)
+    }
+
     /// Puts `text` on the clipboard of the seat the application last received input from.
     ///
     /// The compositor accepts it only in response to input, so call this while handling the

@@ -42,6 +42,7 @@ changelog entry.
 
 ### Added
 
+- On Wayland, add `Clipboard::load_bytes` to read an offered MIME type through the window's existing data device.
 - On Wayland, emit `WindowEvent::Occluded` when the compositor suspends or resumes the window
   (xdg-shell v6 `suspended` state).
 - On Wayland, add `WindowExtWayland::notify_presentation_paused`, which lets winit commit a

@@ -211,6 +211,42 @@ impl ClipboardState {
         Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
     }
 
+    pub fn load_bytes(&self, mime_type: &str) -> io::Result<Vec<u8>> {
+        let inner = self.inner.lock().unwrap();
+        let offer = Self::active_device(&inner)
+            .and_then(|entry| entry.device.data::<DataDeviceData>())
+            .and_then(|data| data.selection_offer());
+
+        let Some(offer) = offer else {
+            return match &inner.owned {
+                Some(owned) => owned_text_bytes(&owned.text, mime_type),
+                None => Err(io::Error::new(ErrorKind::NotFound, "the clipboard is empty")),
+            };
+        };
+
+        let types = offer.with_mime_types(|types| types.to_vec());
+        if types.iter().any(|mime| mime == &self.marker) {
+            // Never wait for our own event loop to serve its selection.
+            if let Some(owned) = &inner.owned {
+                return owned_text_bytes(&owned.text, mime_type);
+            }
+        }
+        if !types.iter().any(|mime| mime == mime_type) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "the clipboard does not offer the requested type",
+            ));
+        }
+
+        let pipe = offer.receive(mime_type.to_owned()).map_err(|error| match error {
+            sctk::data_device_manager::data_offer::DataOfferError::Io(error) => error,
+            other => io::Error::new(ErrorKind::Other, other.to_string()),
+        })?;
+        drop(inner);
+        self.connection.flush().map_err(|error| io::Error::new(ErrorKind::Other, error))?;
+        read_with_timeout(File::from(OwnedFd::from(pipe)))
+    }
+
     pub fn store_text(&self, text: String) -> io::Result<()> {
         let Some(manager) = &self.manager else {
             return Err(io::Error::new(ErrorKind::Unsupported, "no data device manager"));
@@ -283,5 +319,42 @@ fn read_with_timeout(mut file: File) -> io::Result<Vec<u8>> {
             },
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn owned_text_bytes(text: &str, mime_type: &str) -> io::Result<Vec<u8>> {
+    if TEXT_MIME_TYPES.contains(&mime_type) {
+        Ok(text.as_bytes().to_vec())
+    } else {
+        Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "the clipboard does not offer the requested type",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn clipboard_bytes_preserve_binary_data_and_line_endings() {
+        let expected = b"\x89PNG\r\n\x1a\n\0\xff";
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(expected).unwrap();
+        drop(writer);
+        assert_eq!(read_with_timeout(File::from(OwnedFd::from(reader))).unwrap(), expected);
+    }
+
+    #[test]
+    fn our_text_can_be_read_as_raw_text_but_not_as_an_image() {
+        for mime_type in TEXT_MIME_TYPES {
+            assert_eq!(owned_text_bytes("a\r\nb", mime_type).unwrap(), b"a\r\nb");
+        }
+        assert_eq!(
+            owned_text_bytes("text", "image/png").unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
     }
 }
