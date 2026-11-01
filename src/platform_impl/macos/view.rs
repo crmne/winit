@@ -7,8 +7,8 @@ use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
-    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSResponder,
+    NSTextInputClient, NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying,
@@ -43,6 +43,8 @@ impl Default for CursorState {
         Self { visible: true, cursor: default_cursor() }
     }
 }
+
+const KEY_CODE_ESCAPE: u16 = 0x35;
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Default)]
 enum ImeState {
@@ -132,6 +134,18 @@ pub struct ViewState {
     forward_key_to_app: Cell<bool>,
 
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
+
+    /// The character the last key press typed. The accent picker shown while holding a key
+    /// replaces it, so it stands in for the text before the cursor.
+    last_typed: RefCell<Option<String>>,
+
+    /// True if the current key event made the text input system call `insertText:` or
+    /// `doCommandBySelector:`.
+    text_client_called: Cell<bool>,
+
+    /// True while the accent picker is open. It handles the keys pressed meanwhile and commits
+    /// its choice after they were delivered.
+    accent_picker_open: Cell<bool>,
     accepts_first_mouse: bool,
 
     // Weak reference because the window keeps a strong reference to the view
@@ -262,8 +276,11 @@ declare_class!(
         #[method(selectedRange)]
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
-            // Documented to return `{NSNotFound, 0}` if there is no selection.
-            NSRange::new(NSNotFound as NSUInteger, 0)
+            match self.ivars().last_typed.borrow().as_deref() {
+                Some(typed) => NSRange::new(NSString::from_str(typed).length(), 0),
+                // Documented to return `{NSNotFound, 0}` if there is no selection.
+                None => NSRange::new(NSNotFound as NSUInteger, 0),
+            }
         }
 
         #[method(setMarkedText:selectedRange:replacementRange:)]
@@ -360,11 +377,19 @@ declare_class!(
         #[method_id(attributedSubstringForProposedRange:actualRange:)]
         fn attributed_substring_for_proposed_range(
             &self,
-            _range: NSRange,
-            _actual_range: *mut NSRange,
+            range: NSRange,
+            actual_range: *mut NSRange,
         ) -> Option<Retained<NSAttributedString>> {
             trace_scope!("attributedSubstringForProposedRange:actualRange:");
-            None
+            let typed = self.ivars().last_typed.borrow().as_deref().map(NSString::from_str);
+            typed.filter(|typed| range.location == 0 && range.length == typed.length()).map(
+                |typed| {
+                    if !actual_range.is_null() {
+                        unsafe { *actual_range = range };
+                    }
+                    Retained::into_super(NSMutableAttributedString::from_nsstring(&typed))
+                },
+            )
         }
 
         #[method(characterIndexForPoint:)]
@@ -390,9 +415,10 @@ declare_class!(
         }
 
         #[method(insertText:replacementRange:)]
-        fn insert_text(&self, string: &NSObject, _replacement_range: NSRange) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
+        fn insert_text(&self, string: &NSObject, replacement_range: NSRange) {
             trace_scope!("insertText:replacementRange:");
+            self.ivars().text_client_called.set(true);
+            self.ivars().accent_picker_open.set(false);
 
             // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
             let string = if string.is_kind_of::<NSAttributedString>() {
@@ -407,6 +433,23 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
+            let replaces_last_typed = replacement_range.location != NSNotFound as NSUInteger
+                && replacement_range.length > 0
+                && self.ivars().ime_allowed.get()
+                && !is_control
+                && !unsafe { self.hasMarkedText() };
+            if replaces_last_typed {
+                // The accent picker replaces the character that was typed when the key went down.
+                if let Some(typed) = self.ivars().last_typed.take() {
+                    self.queue_event(WindowEvent::Ime(Ime::DeleteSurrounding {
+                        before_chars: typed.chars().count(),
+                        after_chars: 0,
+                    }));
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                }
+                return;
+            }
+
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
@@ -420,6 +463,7 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
+            self.ivars().text_client_called.set(true);
             // We shouldn't forward any character from just committed text, since we'll end up sending
             // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
             // which is not desired given it was used to confirm IME input.
@@ -455,6 +499,7 @@ declare_class!(
             // Get the characters from the event.
             let old_ime_state = self.ivars().ime_state.get();
             self.ivars().forward_key_to_app.set(false);
+            self.ivars().text_client_called.set(false);
             let event = replace_event(event, self.option_as_alt());
 
             // The `interpretKeyEvents` function might call
@@ -487,8 +532,55 @@ declare_class!(
                 _ => old_ime_state != self.ivars().ime_state.get(),
             };
 
+            let is_repeat = unsafe { event.isARepeat() };
+
+            // The accent picker takes over a held key without telling the text client.
+            let is_plain_key = !unsafe { event.modifierFlags() }.intersects(
+                NSEventModifierFlags::NSEventModifierFlagCommand
+                    | NSEventModifierFlags::NSEventModifierFlagControl
+                    | NSEventModifierFlags::NSEventModifierFlagOption,
+            );
+            let held_into_accent_picker = is_repeat
+                && is_plain_key
+                && self.ivars().ime_allowed.get()
+                && !self.ivars().text_client_called.get()
+                && self.ivars().last_typed.borrow().is_some();
+            if held_into_accent_picker {
+                self.ivars().accent_picker_open.set(true);
+            }
+
+            // The picker handles its own keys (choosing, navigating, dismissing).
+            let handled_by_accent_picker = !is_repeat
+                && is_plain_key
+                && self.ivars().accent_picker_open.get()
+                && !self.ivars().text_client_called.get();
+            if handled_by_accent_picker {
+                if unsafe { event.keyCode() } == KEY_CODE_ESCAPE {
+                    self.ivars().accent_picker_open.set(false);
+                }
+                return;
+            }
+
+            if !is_repeat {
+                self.ivars().accent_picker_open.set(false);
+                let typed = (self.ivars().text_client_called.get()
+                    && !had_ime_input
+                    && !self.ivars().forward_key_to_app.get())
+                    .then(|| unsafe { event.characters() }.map(|string| string.to_string()))
+                    .flatten()
+                    .filter(|string| {
+                        let mut chars = string.chars();
+                        chars.next().is_some_and(|c| !c.is_control()) && chars.next().is_none()
+                    });
+                *self.ivars().last_typed.borrow_mut() = typed;
+            }
+
+            if held_into_accent_picker {
+                return;
+            }
+
             if !had_ime_input || self.ivars().forward_key_to_app.get() {
-                let key_event = create_key_event(&event, true, unsafe { event.isARepeat() });
+                let key_event = create_key_event(&event, true, is_repeat);
                 self.queue_event(WindowEvent::KeyboardInput {
                     device_id: DEVICE_ID,
                     event: key_event,
@@ -581,6 +673,7 @@ declare_class!(
         #[method(mouseDown:)]
         fn mouse_down(&self, event: &NSEvent) {
             trace_scope!("mouseDown:");
+            self.ivars().accent_picker_open.set(false);
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Pressed);
         }
@@ -804,6 +897,9 @@ impl WinitView {
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
+            last_typed: Default::default(),
+            text_client_called: Default::default(),
+            accent_picker_open: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
             option_as_alt: Cell::new(option_as_alt),

@@ -439,6 +439,9 @@ impl ApplicationHandler<UserEvent> for Application {
                 Ime::Commit(text) => {
                     info!("Committed: {}", text);
                 },
+                Ime::DeleteSurrounding { before_chars, after_chars } => {
+                    info!("Delete surrounding: {} before, {} after", before_chars, after_chars);
+                },
                 Ime::Disabled => info!("IME disabled for Window={window_id:?}"),
             },
             WindowEvent::PinchGesture { delta, .. } => {
