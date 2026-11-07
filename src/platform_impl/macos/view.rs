@@ -146,6 +146,10 @@ pub struct ViewState {
     /// True while the accent picker is open. It handles the keys pressed meanwhile and commits
     /// its choice after they were delivered.
     accent_picker_open: Cell<bool>,
+
+    /// While `keyDown:` has the text input system interpret a key, the text that key types on
+    /// its own. `None` outside `keyDown:`.
+    key_down_text: RefCell<Option<String>>,
     accepts_first_mouse: bool,
 
     // Weak reference because the window keeps a strong reference to the view
@@ -450,11 +454,39 @@ declare_class!(
                 return;
             }
 
-            // Commit only if we have marked text.
+            // Commit composed text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
+                return;
+            }
+
+            if !self.ivars().ime_allowed.get() || is_control || string.is_empty() {
+                return;
+            }
+
+            // Text inserted without being composed first. Outside a key press it comes from the
+            // Character Viewer (the emoji picker), dictation, or the Services menu, and no key
+            // event carries it. During a key press, an input method can insert something other
+            // than the key's own character: a phrase picked from a candidate list, or
+            // full-width punctuation. The key event's text is then the wrong text.
+            let key_down_text = self.ivars().key_down_text.borrow().clone();
+            match key_down_text {
+                Some(typed) if typed == string => {
+                    // Plain typing: the key event carries this text.
+                }
+                Some(_) => {
+                    self.commit_uncomposed(string);
+                    // Hold back the key event, as after any other commit.
+                    self.ivars().ime_state.set(ImeState::Committed);
+                }
+                None => {
+                    self.commit_uncomposed(string);
+                    if self.ivars().ime_state.get() == ImeState::Disabled {
+                        self.ivars().ime_state.set(ImeState::Ground);
+                    }
+                }
             }
         }
 
@@ -510,7 +542,10 @@ declare_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                *self.ivars().key_down_text.borrow_mut() =
+                    Some(unsafe { event.characters() }.map(|s| s.to_string()).unwrap_or_default());
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                *self.ivars().key_down_text.borrow_mut() = None;
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -900,6 +935,7 @@ impl WinitView {
             last_typed: Default::default(),
             text_client_called: Default::default(),
             accent_picker_open: Default::default(),
+            key_down_text: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
             option_as_alt: Cell::new(option_as_alt),
@@ -941,6 +977,14 @@ impl WinitView {
 
     fn is_ime_enabled(&self) -> bool {
         !matches!(self.ivars().ime_state.get(), ImeState::Disabled)
+    }
+
+    /// Commits text the input system inserted without marked text before it.
+    fn commit_uncomposed(&self, string: String) {
+        if !self.is_ime_enabled() {
+            self.queue_event(WindowEvent::Ime(Ime::Enabled));
+        }
+        self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
     }
 
     fn current_input_source(&self) -> String {
