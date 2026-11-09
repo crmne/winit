@@ -55,3 +55,6 @@ changelog entry.
 - On Windows, fix runaway window growth when dragging across monitors with
   different DPI scale factors.
 - On macOS, show the accent picker when a letter key is held, and replace the typed letter with the choice.
+- On macOS, fix a crash when closing a window on macOS 26 and later, when the
+  text input service asks its view for
+  `firstRectForCharacterRange:actualRange:`.
