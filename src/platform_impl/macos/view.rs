@@ -15,6 +15,7 @@ use objc2_foundation::{
     NSMutableAttributedString, NSNotFound, NSNotificationCenter, NSObject, NSObjectProtocol,
     NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
+use tracing::trace;
 
 use super::app_state::ApplicationDelegate;
 use super::cursor::{default_cursor, invisible_cursor};
@@ -146,6 +147,15 @@ pub struct ViewState {
     /// True while the accent picker is open. It handles the keys pressed meanwhile and commits
     /// its choice after they were delivered.
     accent_picker_open: Cell<bool>,
+
+    /// True while the marked text stands in for `last_typed`: the text input system asked to
+    /// mark the typed character (the accent picker highlights it while open), so it was deleted
+    /// from the application's text and now lives in the preedit until it is committed.
+    marked_text_replaces_typed: Cell<bool>,
+
+    /// True while `keyDown:` runs `interpretKeyEvents:`, to tell text that a key press commits
+    /// from text committed outside one (a click in the accent picker or a candidate window).
+    in_key_down: Cell<bool>,
     accepts_first_mouse: bool,
 
     // Weak reference because the window keeps a strong reference to the view
@@ -288,9 +298,8 @@ declare_class!(
             &self,
             string: &NSObject,
             selected_range: NSRange,
-            _replacement_range: NSRange,
+            replacement_range: NSRange,
         ) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
             trace_scope!("setMarkedText:selectedRange:replacementRange:");
 
             // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
@@ -312,6 +321,40 @@ declare_class!(
                 )
             };
 
+            trace!(
+                marked_len = string.length(),
+                selected = ?(selected_range.location, selected_range.length),
+                replacement = ?(replacement_range.location, replacement_range.length),
+                had_marked_text = unsafe { self.hasMarkedText() },
+                in_key_down = self.ivars().in_key_down.get(),
+                "setMarkedText"
+            );
+
+            // The only text before the cursor this view reports is the character the last key
+            // press typed (see `selectedRange` and `attributedSubstringForProposedRange:`). A
+            // replacement range naming exactly that character, with no composition in progress,
+            // asks to turn it into marked text: the accent picker does this to highlight the
+            // held character while it is open. Delete it from the application's text, or the
+            // preedit shows it a second time and the choice is committed after it.
+            let replaces_typed = replacement_range.location == 0
+                && replacement_range.length > 0
+                && string.length() > 0
+                && self.ivars().ime_allowed.get()
+                && !self.ivars().marked_text_replaces_typed.get()
+                && !unsafe { self.hasMarkedText() };
+            let deleted_typed = replaces_typed
+                .then(|| {
+                    self.ivars()
+                        .last_typed
+                        .borrow()
+                        .as_deref()
+                        .filter(|typed| {
+                            NSString::from_str(typed).length() == replacement_range.length
+                        })
+                        .map(|typed| typed.chars().count())
+                })
+                .flatten();
+
             // Update marked text.
             *self.ivars().marked_text.borrow_mut() = marked_text;
 
@@ -319,6 +362,15 @@ declare_class!(
             if self.ivars().ime_state.get() == ImeState::Disabled {
                 *self.ivars().input_source.borrow_mut() = self.current_input_source();
                 self.queue_event(WindowEvent::Ime(Ime::Enabled));
+            }
+
+            if let Some(before_chars) = deleted_typed {
+                trace!(before_chars, "setMarkedText replaces the typed character");
+                self.ivars().marked_text_replaces_typed.set(true);
+                self.queue_event(WindowEvent::Ime(Ime::DeleteSurrounding {
+                    before_chars,
+                    after_chars: 0,
+                }));
             }
 
             if unsafe { self.hasMarkedText() } {
@@ -354,12 +406,31 @@ declare_class!(
         #[method(unmarkText)]
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
-            *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+            let marked_text = std::mem::replace(
+                &mut *self.ivars().marked_text.borrow_mut(),
+                NSMutableAttributedString::new(),
+            );
+            let replaces_typed = self.ivars().marked_text_replaces_typed.replace(false);
+            trace!(
+                marked_len = marked_text.length(),
+                replaces_typed,
+                in_key_down = self.ivars().in_key_down.get(),
+                "unmarkText"
+            );
 
             let input_context = self.inputContext().expect("input context");
             input_context.discardMarkedText();
 
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+            if replaces_typed {
+                // The marked text is the typed character, already deleted from the application's
+                // text (the accent picker was dismissed without a choice): put it back.
+                let string = marked_text.string().to_string();
+                if !string.is_empty() {
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                }
+                self.ivars().last_typed.take();
+            }
             if self.is_ime_enabled() {
                 // Leave the Preedit self.ivars()
                 self.ivars().ime_state.set(ImeState::Ground);
@@ -432,29 +503,59 @@ declare_class!(
             };
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
+            let in_key_down = self.ivars().in_key_down.get();
+            let has_marked_text = unsafe { self.hasMarkedText() };
+            // Set when the typed character was already deleted and moved into the marked text.
+            let marked_text_replaced_typed =
+                self.ivars().marked_text_replaces_typed.replace(false);
+            trace!(
+                len = string.chars().count(),
+                replacement = ?(replacement_range.location, replacement_range.length),
+                has_marked_text,
+                marked_text_replaced_typed,
+                in_key_down,
+                "insertText"
+            );
 
             let replaces_last_typed = replacement_range.location != NSNotFound as NSUInteger
                 && replacement_range.length > 0
                 && self.ivars().ime_allowed.get()
                 && !is_control
-                && !unsafe { self.hasMarkedText() };
+                && !has_marked_text;
             if replaces_last_typed {
                 // The accent picker replaces the character that was typed when the key went down.
                 if let Some(typed) = self.ivars().last_typed.take() {
-                    self.queue_event(WindowEvent::Ime(Ime::DeleteSurrounding {
-                        before_chars: typed.chars().count(),
-                        after_chars: 0,
-                    }));
+                    if !marked_text_replaced_typed {
+                        self.queue_event(WindowEvent::Ime(Ime::DeleteSurrounding {
+                            before_chars: typed.chars().count(),
+                            after_chars: 0,
+                        }));
+                    }
                     self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                    if in_key_down {
+                        // The key that chose (a number in the picker) is not text of its own.
+                        self.ivars().ime_state.set(ImeState::Committed);
+                    }
                 }
                 return;
             }
 
             // Commit only if we have marked text.
-            if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
+            if has_marked_text && self.is_ime_enabled() && !is_control {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
-                self.ivars().ime_state.set(ImeState::Committed);
+                if marked_text_replaced_typed {
+                    self.ivars().last_typed.take();
+                }
+                if in_key_down {
+                    // `keyDown:` clears the marked text and drops the key that committed.
+                    self.ivars().ime_state.set(ImeState::Committed);
+                } else {
+                    // Committed by a click, with no key press to consume the state: clear the
+                    // marked text now and let the next key press through.
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.ivars().ime_state.set(ImeState::Ground);
+                }
             }
         }
 
@@ -510,7 +611,9 @@ declare_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                self.ivars().in_key_down.set(true);
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                self.ivars().in_key_down.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -563,6 +666,9 @@ declare_class!(
 
             if !is_repeat {
                 self.ivars().accent_picker_open.set(false);
+                if !unsafe { self.hasMarkedText() } {
+                    self.ivars().marked_text_replaces_typed.set(false);
+                }
                 let typed = (self.ivars().text_client_called.get()
                     && !had_ime_input
                     && !self.ivars().forward_key_to_app.get())
@@ -900,6 +1006,8 @@ impl WinitView {
             last_typed: Default::default(),
             text_client_called: Default::default(),
             accent_picker_open: Default::default(),
+            marked_text_replaces_typed: Default::default(),
+            in_key_down: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
             option_as_alt: Cell::new(option_as_alt),
@@ -983,7 +1091,20 @@ impl WinitView {
         }
 
         // Clear markedText
-        *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+        let marked_text = std::mem::replace(
+            &mut *self.ivars().marked_text.borrow_mut(),
+            NSMutableAttributedString::new(),
+        );
+        self.ivars().last_typed.take();
+        if self.ivars().marked_text_replaces_typed.replace(false) {
+            // The marked text is the typed character, already deleted from the application's
+            // text: put it back before IME goes away.
+            let string = marked_text.string().to_string();
+            self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+            if !string.is_empty() {
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+            }
+        }
 
         if self.ivars().ime_state.get() != ImeState::Disabled {
             self.ivars().ime_state.set(ImeState::Disabled);
