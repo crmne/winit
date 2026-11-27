@@ -57,3 +57,5 @@ changelog entry.
 - On macOS, show the accent picker when a letter key is held, and replace the typed letter with the choice.
 - On macOS, stop the accent picker from leaving the held letter in front of the choice when it marks that letter while open.
 - On macOS, let the next key press through after a click commits IME text.
+- On Wayland, send the latest input serial and its seat with `Window::request_activation_token()`,
+  so compositors that check it accept the token.
