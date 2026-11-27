@@ -28,6 +28,7 @@ use crate::window::{
     WindowAttributes, WindowButtons, WindowLevel,
 };
 
+use super::clipboard::ClipboardState;
 use super::event_loop::sink::EventSink;
 use super::output::MonitorHandle;
 use super::state::WinitState;
@@ -558,6 +559,12 @@ impl Window {
         let data = XdgActivationTokenData::Obtain((self.window_id, serial));
         let xdg_activation_token = xdg_activation.get_activation_token(&self.queue_handle, data);
         xdg_activation_token.set_surface(self.surface());
+        // The clipboard follows which seat gave input last, and its serial.
+        let display = self.display.id().as_ptr().cast();
+        let input = ClipboardState::for_display(display).and_then(|state| state.latest_input());
+        if let Some((seat, input_serial)) = input {
+            xdg_activation_token.set_serial(input_serial, &seat);
+        }
         xdg_activation_token.commit();
 
         Ok(serial)

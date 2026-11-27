@@ -20,6 +20,7 @@ use sctk::reexports::client::backend::ObjectId;
 use sctk::reexports::client::protocol::wl_data_device::WlDataDevice;
 use sctk::reexports::client::protocol::wl_data_device_manager::WlDataDeviceManager;
 use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
+use sctk::reexports::client::protocol::wl_seat::WlSeat;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
 use crate::platform_impl::wayland::state::WinitState;
@@ -125,6 +126,16 @@ impl ClipboardState {
             entry.serial = Some(serial);
             inner.active_seat = Some(seat.clone());
         }
+    }
+
+    /// The seat last used and the serial of its latest input, which an
+    /// activation token request names to show that the user asked for it.
+    pub fn latest_input(&self) -> Option<(WlSeat, u32)> {
+        let inner = self.inner.lock().unwrap();
+        let active = inner.active_seat.as_ref()?;
+        let serial = inner.seats.iter().find(|entry| &entry.seat == active)?.serial?;
+        let seat = WlSeat::from_id(&self.connection, active.clone()).ok()?;
+        Some((seat, serial))
     }
 
     /// The text of our own selection for a source the compositor asks to send.
